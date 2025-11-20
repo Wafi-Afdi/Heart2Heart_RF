@@ -2,11 +2,15 @@ import joblib
 import numpy as np
 import neurokit2 as nk2
 from fastapi import FastAPI, HTTPException
+from scipy.signal import welch
 from pydantic import BaseModel
 from typing import List
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import os
+import warnings
+import traceback
+
 
 # Initialize FastAPI
 app = FastAPI(title="ECG Diagnosis API")
@@ -35,50 +39,51 @@ def load_model():
     else:
         print(f"Error: Model not found at {MODEL_PATH}")
 
-def extract_features(segment_list: List[float], fs=250) -> List[float]:
-    """
-    Replicates the exact logic from the Jupyter Notebook cell 13.
-    """
-    # Convert list to numpy array for processing
-    segment = np.array(segment_list)
-    
-    features = []
-    
-    # --- 1. HR Variability Features (via NeuroKit2) ---
+def extract_features(segment, fs=250):
+    segment_list = np.array(segment)
+    segment_clean = segment_list[~np.isnan(segment_list)]
+    if len(segment_clean) == 0:
+        return [0] * 5  # 5 fitur
+
     try:
-        # Note: cleaning is skipped here as it wasn't in the notebook's extractFeatures function
-        _, rpeaks = nk2.ecg_peaks(segment, sampling_rate=fs)
-        
-        # Calculate RR intervals in seconds
-        rr = np.diff(rpeaks["ECG_R_Peaks"]) / fs
-        
-        if len(rr) < 2:
-            rr = np.array([0])
-    except Exception:
-        rr = np.array([0])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            ecg_signals, info = nk2.ecg_peaks(pd.Series(segment_clean), sampling_rate=fs)
+            peaks = info["ECG_R_Peaks"]
+    except:
+        peaks = np.array([])
 
-    mean_rr = np.mean(rr)
-    median_rr = np.median(rr)
-    sdnn = np.std(rr)
-    features += [mean_rr, median_rr, sdnn]
+    mean_hr = 0
+    sdnn = 0
+    if len(peaks) >= 2:
+        rr = np.diff(peaks) / fs
+        hr = 60.0 / rr
+        mean_hr = np.mean(hr)
+        sdnn = np.std(rr)
 
-    # --- 2. Statistical Features (Manual calculation per notebook) ---
-    mean_val = np.mean(segment)
-    std_val = np.std(segment)
-    
-    # Skewness calculation from notebook
-    skew_val = np.mean((segment - mean_val)**3) / (std_val**3 + 1e-8)
-    
-    # Kurtosis calculation from notebook
-    kurt_val = np.mean((segment - mean_val)**4) / (std_val**4 + 1e-8)
-    
-    min_val = np.min(segment)
-    max_val = np.max(segment)
-    range_val = max_val - min_val
+    qrs_width = 0
+    if len(peaks) > 0:
+        widths = []
+        for p in peaks:
+            start = max(0, p - int(0.05 * fs))
+            end = min(len(segment_clean), p + int(0.05 * fs))
+            diff = np.abs(np.diff(segment_clean[start:end]))
+            if len(diff) > 0:
+                widths.append(np.std(diff))
+        if len(widths) > 0:
+            qrs_width = np.mean(widths)
 
-    features += [mean_val, std_val, skew_val, kurt_val, min_val, max_val, range_val]
-    
-    return features
+    spectral_entropy = 0
+    try:
+        freqs, power = welch(segment_clean, fs)
+        power_norm = power / np.sum(power)
+        spectral_entropy = -np.sum(power_norm * np.log2(power_norm + 1e-12))
+    except:
+        spectral_entropy = 0
+
+    rms_amp = np.sqrt(np.mean(segment_clean**2))
+
+    return [mean_hr, sdnn, qrs_width, spectral_entropy, rms_amp]
 
 def run_inference(signal: List[float]):
     """
@@ -90,7 +95,9 @@ def run_inference(signal: List[float]):
     
     # 1. Preprocess
     # The notebook uses fs=250 as default
+    print(f"Feature {len(signal)}")
     features = extract_features(signal, fs=250)
+    print("Feature", features)
     
     # 2. Reshape for sklearn (1 sample, n features)
     features_reshaped = np.array(features).reshape(1, -1)
@@ -119,4 +126,6 @@ async def generate_diagnosis(input_data: ECGInput):
         return {"result": result}
 
     except Exception as e:
+        traceback.print_exc()
+        print(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
